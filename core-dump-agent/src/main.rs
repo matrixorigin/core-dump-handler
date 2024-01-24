@@ -388,7 +388,7 @@ fn get_bucket() -> Result<Bucket, anyhow::Error> {
         bucket: s3_bucket_name,
         location_supported: false,
     };
-    Ok(Bucket::new(&s3.bucket, s3.region, s3.credentials)?.with_path_style())
+    Ok(Bucket::new(&s3.bucket, s3.region, s3.credentials)?)
 }
 
 async fn run_polling_agent() {
