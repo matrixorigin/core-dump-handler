@@ -2,7 +2,7 @@ FROM registry.access.redhat.com/ubi7/ubi as rhel7builder
 
 RUN yum install -y gcc openssl-devel && \
     rm -rf /var/cache/dnf && \
-    curl https://sh.rustup.rs -sSf | sh -s -- -y
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 COPY . /app-build
 
@@ -16,7 +16,7 @@ FROM registry.access.redhat.com/ubi8/ubi as rhel8builder
 
 RUN yum install -y gcc openssl-devel && \
     rm -rf /var/cache/dnf && \
-    curl https://sh.rustup.rs -sSf | sh -s -- -y
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 COPY . /app-build
 

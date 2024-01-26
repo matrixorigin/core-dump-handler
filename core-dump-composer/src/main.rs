@@ -8,15 +8,16 @@ use log::{debug, error, info};
 use serde_json::json;
 use serde_json::Value;
 use std::env;
-use std::fs::File;
+use std::fs::{File, write, remove_dir_all, create_dir, create_dir_all};
 use std::io;
 use std::io::prelude::*;
 use std::process;
 use std::sync::mpsc::channel;
 use std::thread;
 use std::time::Duration;
-use zip::write::FileOptions;
-use zip::ZipWriter;
+use tar::Builder;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 
 mod config;
 mod events;
@@ -75,14 +76,11 @@ fn handle(mut cc: config::CoreConfig) -> Result<(), anyhow::Error> {
         config_path,
         image_command: l_image_command,
     };
-    let pod_object = match cli.pod(&cc.params.hostname) {
-        Ok(v) => v,
-        Err(e) => {
-            error!("{}", e);
-            // We fall through here as the coredump and info can still be captured.
-            json!({})
-        }
-    };
+    let pod_object = cli.pod(&cc.params.hostname).unwrap_or_else(|e| {
+        error!("{}", e);
+        // We fall through here as the coredump and info can still be captured.
+        json!({})
+    });
 
     // match the label filter if there's one, and skip the whole process if it doesn't match
     if !cc.pod_selector_label.is_empty() {
@@ -113,18 +111,8 @@ fn handle(mut cc: config::CoreConfig) -> Result<(), anyhow::Error> {
 
     cc.set_podname(podname.to_string());
 
-    // Create the base zip file that we are going to put everything into
-    let compression_method = if cc.compression {
-        zip::CompressionMethod::Deflated
-    } else {
-        zip::CompressionMethod::Stored
-    };
-    let options = FileOptions::default()
-        .compression_method(compression_method)
-        .unix_permissions(0o444)
-        .large_file(true);
-
-    let file = match File::create(cc.get_zip_full_path()) {
+    // Create the base tar file that we are going to put everything into
+    let file = match File::create(cc.get_tar_full_path()) {
         Ok(v) => v,
         Err(e) => {
             error!("Failed to create file: {}", e);
@@ -132,81 +120,80 @@ fn handle(mut cc: config::CoreConfig) -> Result<(), anyhow::Error> {
         }
     };
     file.lock(FileLockMode::Exclusive)?;
-    let mut zip = ZipWriter::new(&file);
+    let mut tar_core = Builder::new(file);
+
+    match create_dir_all("/tmp/core") {
+        Ok(_) => println!("Folder is created successfully."),
+        Err(e) => println!("Error while creating folder: {}", e),
+    }
 
     debug!(
         "Create a JSON file to store the dump meta data\n{}",
         cc.get_dump_info_filename()
     );
 
-    match zip.start_file(cc.get_dump_info_filename(), options) {
+    match write(format!("{}/{}","/tmp/core",cc.get_dump_info_filename()), cc.get_dump_info().as_bytes()) {
         Ok(v) => v,
         Err(e) => {
-            error!("Error starting dump file in zip \n{}", e);
-            zip.finish()?;
-            file.unlock()?;
+            error!("Error starting dump file in temp file \n{}", e);
+            tar_core.finish()?;
+            // file.unlock()?;
+            remove_dir_all("/tmp/core").unwrap();
             process::exit(1);
         }
     };
 
-    match zip.write_all(cc.get_dump_info().as_bytes()) {
-        Ok(v) => v,
-        Err(e) => {
-            error!("Error writing pod file in zip \n{}", e);
-            zip.finish()?;
-            file.unlock()?;
-            process::exit(1);
-        }
-    };
 
     // Pipe the core file to zip
-    match zip.start_file(cc.get_core_filename(), options) {
+    let core_file = match File::create(format!("{}/{}.gz","/tmp/core",cc.get_core_filename())) {
         Ok(v) => v,
-        Err(e) => error!("Error starting core file \n{}", e),
+        Err(e) => {
+            error!("Failed to create core file: {}", e);
+            remove_dir_all("/tmp/core").unwrap();
+            process::exit(1);
+        }
     };
+    core_file.lock(FileLockMode::Exclusive)?;
+    let mut encoder = GzEncoder::new(&core_file, Compression::fast());
 
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
 
-    match io::copy(&mut stdin, &mut zip) {
+    match io::copy(&mut stdin, &mut encoder) {
         Ok(v) => v,
         Err(e) => {
             error!("Error writing core file \n{}", e);
+            core_file.unlock();
+            remove_dir_all("/tmp/core").unwrap();
             process::exit(1);
         }
     };
-    zip.flush()?;
+    encoder.finish()?;
+    core_file.unlock()?;
+
 
     if cc.ignore_crio {
         if cc.core_events {
-            let zip_name = format!("{}.zip", cc.get_templated_name());
+            let tar_name = format!("{}.tar", cc.get_templated_name());
             let evtdir = format!("{}", cc.event_location.display());
-            let evt = CoreEvent::new_no_crio(cc.params, zip_name);
+            let evt = CoreEvent::new_no_crio(cc.params, tar_name);
             evt.write_event(&evtdir)?;
         }
-        zip.finish()?;
-        file.unlock()?;
+        tar_core.append_dir_all("core","/tmp/core").unwrap();
+        tar_core.finish()?;
+        remove_dir_all("/tmp/core").unwrap();
+        // file.unlock()?;
         process::exit(0);
     }
 
     debug!("Using runtime_file_name:{}", cc.get_pod_filename());
 
-    match zip.start_file(cc.get_pod_filename(), options) {
+    match write(format!("{}/{}","/tmp/core",cc.get_pod_filename()), pod_object.to_string().as_bytes()) {
         Ok(v) => v,
         Err(e) => {
-            error!("Error starting pod file in zip \n{}", e);
-            zip.finish()?;
-            file.unlock()?;
-            process::exit(1);
-        }
-    };
-
-    match zip.write_all(pod_object.to_string().as_bytes()) {
-        Ok(v) => v,
-        Err(e) => {
-            error!("Error writing pod file in zip \n{}", e);
-            zip.finish()?;
-            file.unlock()?;
+            error!("Error starting dump file in temp file \n{}", e);
+            tar_core.finish()?;
+            // file.unlock()?;
             process::exit(1);
         }
     };
@@ -216,8 +203,9 @@ fn handle(mut cc: config::CoreConfig) -> Result<(), anyhow::Error> {
         Some(v) => v,
         None => {
             error!("Failed to get pod id");
-            zip.finish()?;
-            file.unlock()?;
+            tar_core.finish()?;
+            // file.unlock()?;
+            remove_dir_all("/tmp/core").unwrap();
             process::exit(1);
         }
     };
@@ -225,67 +213,49 @@ fn handle(mut cc: config::CoreConfig) -> Result<(), anyhow::Error> {
     // With the pod_id get the runtime information from crictl
     debug!("Getting inspectp output using pod_id:{}", pod_id);
 
-    let inspectp = match cli.inspect_pod(pod_id) {
-        Ok(v) => v,
-        Err(e) => {
-            error!("Failed to inspect pod {}", e);
-            json!({})
-        }
-    };
+    let inspectp = cli.inspect_pod(pod_id).unwrap_or_else(|e| {
+        error!("Failed to inspect pod {}", e);
+        json!({})
+    });
     debug!("Starting inspectp file\n{}", cc.get_inspect_pod_filename());
-    match zip.start_file(cc.get_inspect_pod_filename(), options) {
+
+    match write(format!("{}/{}","/tmp/core",cc.get_inspect_pod_filename()), cc.get_inspect_pod_filename()) {
         Ok(v) => v,
         Err(e) => {
-            error!("Error starting inspect pod file in zip \n{}", e);
-            zip.finish()?;
-            file.unlock()?;
+            error!("Error starting dump file in temp file \n{}", e);
+            tar_core.finish()?;
+            // file.unlock()?;
+            remove_dir_all("/tmp/core").unwrap();
             process::exit(1);
         }
     };
-    debug!("Writing inspectp file\n{}", cc.get_inspect_pod_filename());
-    match zip.write_all(inspectp.to_string().as_bytes()) {
-        Ok(v) => v,
-        Err(e) => {
-            error!("Error writing inspect pod file in zip \n{}", e);
-            zip.finish()?;
-            file.unlock()?;
-            process::exit(1);
-        }
-    };
+
 
     // Get the container_image_name based on the pod_id
     let ps_object = match cli.pod_containers(pod_id) {
         Ok(v) => v,
         Err(e) => {
             error!("{}", e);
-            zip.finish()?;
-            file.unlock()?;
+            tar_core.finish()?;
+            // file.unlock()?;
+            remove_dir_all("/tmp/core").unwrap();
             process::exit(1);
         }
     };
 
     debug!("Starting ps file \n{}", cc.get_ps_filename());
-    match zip.start_file(cc.get_ps_filename(), options) {
+    match write(format!("{}/{}","/tmp/core",cc.get_ps_filename()), ps_object.to_string().as_bytes()) {
         Ok(v) => v,
         Err(e) => {
-            error!("Error starting ps file in zip \n{}", e);
-            zip.finish()?;
-            file.unlock()?;
+            error!("Error starting dump file in temp file \n{}", e);
+            tar_core.finish()?;
+            // file.unlock()?;
+            remove_dir_all("/tmp/core").unwrap();
             process::exit(1);
         }
     };
 
-    debug!("Writing ps file \n{}", cc.get_ps_filename());
-    match zip.write_all(ps_object.to_string().as_bytes()) {
-        Ok(v) => v,
-        Err(e) => {
-            error!("Error writing ps file in zip \n{}", e);
-            zip.finish()?;
-            file.unlock()?;
-            process::exit(1);
-        }
-    };
-
+    // this still have bug, please do not use it
     debug!("Successfully got the process details {}", ps_object);
     let mut images: Vec<Value> = vec![];
     if let Some(containers) = ps_object["containers"].as_array() {
@@ -298,65 +268,41 @@ fn handle(mut cc: config::CoreConfig) -> Result<(), anyhow::Error> {
                 }
             };
             let log =
-                match cli.tail_logs(container["id"].as_str().unwrap_or_default(), cc.log_length) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("Error finding logs:\n{}", e);
-                        "".to_string()
-                    }
-                };
+                cli.tail_logs(container["id"].as_str().unwrap_or_default(), cc.log_length).unwrap_or_else(|e| {
+                    error!("Error finding logs:\n{}", e);
+                    "".to_string()
+                });
             debug!("Starting log file \n{}", cc.get_log_filename(counter));
-            match zip.start_file(cc.get_log_filename(counter), options) {
+            match write(format!("{}/{}","/tmp/core",cc.get_log_filename(counter)), log.to_string().as_bytes()) {
                 Ok(v) => v,
                 Err(e) => {
-                    error!("Error starting log file in zip \n{}", e);
-                    zip.finish()?;
-                    file.unlock()?;
-                    process::exit(1);
-                }
-            };
-            debug!("Writing file output \n{}", log);
-            // TODO: Should this be streamed?
-            match zip.write_all(log.to_string().as_bytes()) {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("Error writing log file in zip \n{}", e);
-                    zip.finish()?;
-                    file.unlock()?;
+                    error!("Error starting dump file in temp file \n{}", e);
+                    tar_core.finish()?;
+                    // file.unlock()?;
+                    remove_dir_all("/tmp/core").unwrap();
                     process::exit(1);
                 }
             };
             debug!("found img_id {}", img_ref);
-            let image = match cli.image(img_ref) {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("Error finding image:\n{}", e);
-                    json!({})
-                }
-            };
+            let image = cli.image(img_ref).unwrap_or_else(|e| {
+                error!("Error finding image:\n{}", e);
+                json!({})
+            });
 
             let img_clone = image.clone();
             images.push(img_clone);
             debug!("Starting image file \n{}", cc.get_image_filename(counter));
-            match zip.start_file(cc.get_image_filename(counter), options) {
+            match write(format!("{}/{}","/tmp/core",cc.get_image_filename(counter)), image.to_string().as_bytes()) {
                 Ok(v) => v,
                 Err(e) => {
-                    error!("Error starting ps file in zip \n{}", e);
-                    zip.finish()?;
-                    file.unlock()?;
+                    error!("Error starting dump file in temp file \n{}", e);
+                    tar_core.finish()?;
+                    // file.unlock()?;
+                    remove_dir_all("/tmp/core").unwrap();
                     process::exit(1);
                 }
             };
-            debug!("Writing image file \n{}", cc.get_image_filename(counter));
-            match zip.write_all(image.to_string().as_bytes()) {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("Error writing ps file in zip \n{}", e);
-                    zip.finish()?;
-                    file.unlock()?;
-                    process::exit(1);
-                }
-            };
+
             debug!(
                 "Getting logs for container id {}",
                 container["id"].as_str().unwrap_or_default()
@@ -364,12 +310,17 @@ fn handle(mut cc: config::CoreConfig) -> Result<(), anyhow::Error> {
         }
     };
 
-    zip.finish()?;
-    file.unlock()?;
+    tar_core.append_dir_all("core","/tmp/core").unwrap();
+    tar_core.finish()?;
+    match remove_dir_all("/tmp/core") {
+        Ok(_) => println!("Folder is deleted successfully."),
+        Err(e) => println!("Error while deleting folder: {}", e),
+    }
+    // file.unlock()?;
     if cc.core_events {
-        let zip_name = format!("{}.zip", cc.get_templated_name());
+        let tar_name = format!("{}.tar", cc.get_templated_name());
         let evtdir = format!("{}", cc.event_location.display());
-        let evt = CoreEvent::new(cc.params, zip_name, pod_object, images);
+        let evt = CoreEvent::new(cc.params, tar_name, pod_object, images);
         evt.write_event(&evtdir)?;
     }
     Ok(())

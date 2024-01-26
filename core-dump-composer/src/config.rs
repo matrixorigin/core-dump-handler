@@ -237,6 +237,14 @@ impl CoreConfig {
             self.get_templated_name()
         )
     }
+
+    pub fn get_tar_full_path(&self) -> String {
+        format!(
+            "{}/{}.tar",
+            self.params.directory,
+            self.get_templated_name()
+        )
+    }
 }
 
 pub fn try_get_matches() -> clap::Result<ArgMatches> {

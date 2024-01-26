@@ -8,6 +8,7 @@ use std::str::FromStr;
 pub fn init_logger(loglevel: String) -> Result<String, anyhow::Error> {
     let logfilter = match LevelFilter::from_str(loglevel.as_str()) {
         Ok(v) => v,
+        Ok(v) => v,
         Err(_) => LevelFilter::Debug,
     };
 

@@ -10,7 +10,7 @@ edition = "2021"
 clap = "3.2.22"
 advisory-lock = "0.3.0"
 uuid = { version = "1.1.0", features = ["serde", "v4"] }
-zip = "0.6.2"
+tar = "0.4"
 dotenv  = "0.15.0"
 log = "0.4.14"
 log4rs = "1.2.0"
@@ -20,6 +20,7 @@ serde = { version = "1.0.134", features = ["derive"] }
 hostname = "0.3.1"
 libcrio = "2.0.0"
 tinytemplate = "1.2.1"
+flate2 = "1.0.28"
 
 [dev-dependencies]
 rand = "0.8.5"

@@ -19,6 +19,7 @@ use std::process::Command;
 use std::time::Duration;
 use thiserror::Error;
 use tokio_cron_scheduler::{Job, JobScheduler};
+use sha256::try_digest;
 
 #[allow(dead_code)]
 struct Storage {
@@ -117,7 +118,7 @@ async fn main() -> Result<(), anyhow::Error> {
         format!("{host_location}/core_pattern.bak").as_str(),
         format!(
             "|{host_location}/{CDC_NAME} -c=%c -e=%e -p=%p -s=%s -t=%t -d={core_dir_command} -h=%h -E=%E")
-        .as_str(),
+            .as_str(),
     )?;
     apply_sysctl(
         "kernel.core_pipe_limit",
@@ -328,6 +329,10 @@ async fn process_file(zip_path: &Path, bucket: &Bucket) {
         .await
         .expect("file was removed");
 
+    // check sha256 sum
+    let val = try_digest(zip_path).unwrap();
+    info!("zip sha256 is {}", val);
+
     let code = match bucket
         .put_object_stream(&mut fasync, upload_file_name)
         .await
@@ -388,7 +393,7 @@ fn get_bucket() -> Result<Bucket, anyhow::Error> {
         bucket: s3_bucket_name,
         location_supported: false,
     };
-    Ok(Bucket::new(&s3.bucket, s3.region, s3.credentials)?)
+    Ok(Bucket::new(&s3.bucket, s3.region, s3.credentials).unwrap())
 }
 
 async fn run_polling_agent() {
